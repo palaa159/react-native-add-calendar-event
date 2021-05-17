@@ -1,279 +1,385 @@
-package com.vonovak;
+#import "AddCalendarEvent.h"
+#import "EKEventStoreSingleton.h"
 
-import android.app.Activity;
-import android.content.ContentResolver;
-import android.content.ContentUris;
-import android.content.CursorLoader;
-import android.content.Intent;
-import android.database.Cursor;
-import android.net.Uri;
-import android.os.Bundle;
-import android.provider.CalendarContract;
-import android.app.LoaderManager;
-import android.content.Loader;
-import android.util.Log;
-import androidx.annotation.Nullable;
+@interface AddCalendarEvent()
 
-import com.facebook.react.bridge.*;
+@property (nonatomic) EKCalendar *defaultCalendar;
+@property (nonatomic) UIViewController *viewController;
+@property (nonatomic) BOOL calendarAccessGranted;
+@property (nonatomic) NSDictionary *eventOptions;
 
-import java.util.HashMap;
-import java.util.Map;
+@property (nonatomic) RCTPromiseResolveBlock resolver;
+@property (nonatomic) RCTPromiseRejectBlock rejecter;
 
-import static com.vonovak.Utils.doesEventExist;
-import static com.vonovak.Utils.extractLastEventId;
-import static com.vonovak.Utils.getTimestamp;
+@end
 
 
-public class AddCalendarEventModule extends ReactContextBaseJavaModule implements ActivityEventListener, LoaderManager.LoaderCallbacks {
+@implementation AddCalendarEvent
 
-    public static final String ADD_EVENT_MODULE_NAME = "AddCalendarEvent";
-    private static final int ADD_EVENT_REQUEST_CODE = 11;
-    private static final int SHOW_EVENT_REQUEST_CODE = 12;
-    private static final int PRIOR_RESULT_ID = 1;
-    private static final int POST_RESULT_ID = 2;
-    private Promise promise;
-    private Long eventPriorId;
-    private Long shownOrEditedEventId;
+- (dispatch_queue_t)methodQueue
+{
+    return dispatch_get_main_queue();
+}
 
-    private static final String DELETED = "DELETED";
-    private static final String SAVED = "SAVED";
-    private static final String CANCELED = "CANCELED";
-    private static final String DONE = "DONE";
-    private static final String RESPONDED = "RESPONDED";
+RCT_EXPORT_MODULE()
+    
++ (BOOL)requiresMainQueueSetup
+{
+    return NO;
+}
+
+static NSString *const DELETED = @"DELETED";
+static NSString *const SAVED = @"SAVED";
+static NSString *const CANCELED = @"CANCELED";
+static NSString *const DONE = @"DONE";
+static NSString *const RESPONDED = @"RESPONDED";
+
+- (NSDictionary *)constantsToExport
+{
+    return @{
+             DELETED: DELETED,
+             SAVED: SAVED,
+             CANCELED: CANCELED,
+             DONE: DONE,
+             RESPONDED: RESPONDED
+             };
+}
+
+static NSString *const _eventId = @"eventId";
+static NSString *const _title = @"title";
+static NSString *const _location = @"location";
+static NSString *const _startDate = @"startDate";
+static NSString *const _endDate = @"endDate";
+static NSString *const _notes = @"notes";
+static NSString *const _url = @"url";
+static NSString *const _allDay = @"allDay";
+static NSString *const _alert = @"alert";
+
+static NSString *const MODULE_NAME= @"AddCalendarEvent";
 
 
-    @Override
-    public Map<String, Object> getConstants() {
-        final Map<String, Object> constants = new HashMap<>();
-        constants.put(DELETED, DELETED);
-        constants.put(SAVED, SAVED);
-        constants.put(CANCELED, CANCELED);
-        constants.put(DONE, DONE);
-        constants.put(RESPONDED, RESPONDED);
-        return constants;
+- (EKEventStore *)getEventStoreInstance {
+    return [EKEventStoreSingleton getInstance];
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self != nil) {
+        self.calendarAccessGranted = NO;
+        self.defaultCalendar = nil; // defaultCalendar not used in the module at this point
+        [self resetPromises];
     }
+    return self;
+}
 
+#pragma mark -
+#pragma mark Calendar permission methods
 
-    public AddCalendarEventModule(ReactApplicationContext reactContext) {
-        super(reactContext);
-        reactContext.addActivityEventListener(this);
-        resetMembers();
-    }
+RCT_EXPORT_METHOD(requestCalendarPermission:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+{
+    self.resolver = resolve;
+    self.rejecter = reject;
+    
+    [self checkEventStoreAccessForCalendar];
+}
 
-    private void resetMembers() {
-        promise = null;
-        eventPriorId = 0L;
-        shownOrEditedEventId = 0L;
-    }
-
-    private boolean isEventBeingEdited() {
-        return shownOrEditedEventId != 0L;
-    }
-
-    @Override
-    public String getName() {
-        return ADD_EVENT_MODULE_NAME;
-    }
-
-    @ReactMethod
-    public void presentEventCreatingDialog(ReadableMap config, Promise eventPromise) {
-        promise = eventPromise;
-
-        this.presentEventAddingActivity(config);
-    }
-
-    private void presentEventAddingActivity(ReadableMap config) {
-        try {
-            setPriorEventId(getCurrentActivity());
-
-            final Intent calendarIntent = new Intent(Intent.ACTION_INSERT);
-            calendarIntent
-                    .setType("vnd.android.cursor.item/event")
-                    .putExtra("title", config.getString("title"));
-
-            if (config.hasKey("startDate")) {
-                calendarIntent.putExtra("beginTime", getTimestamp(config.getString("startDate")));
-            }
-
-            if (config.hasKey("endDate")) {
-                calendarIntent.putExtra("endTime", getTimestamp(config.getString("endDate")));
-            }
-
-            if (config.hasKey("location")
-                    && config.getString("location") != null) {
-                calendarIntent.putExtra("eventLocation", config.getString("location"));
-            }
-
-            if (config.hasKey("notes")
-                    && config.getString("notes") != null) {
-                calendarIntent.putExtra("description", config.getString("notes"));
-            }
-
-            if (config.hasKey("allDay")) {
-                calendarIntent.putExtra("allDay", config.getBoolean("allDay"));
-            }
-
-
-            getReactApplicationContext().startActivityForResult(calendarIntent, ADD_EVENT_REQUEST_CODE, Bundle.EMPTY);
-        } catch (Exception e) {
-            rejectPromise(e);
+- (void)checkEventStoreAccessForCalendar
+{
+    EKAuthorizationStatus status = [EKEventStore authorizationStatusForEntityType:EKEntityTypeEvent];
+    
+    switch (status)
+    {
+        case EKAuthorizationStatusAuthorized: [self markCalendarAccessAsGranted];
+            break;
+        case EKAuthorizationStatusNotDetermined: [self requestCalendarAccess];
+            break;
+        case EKAuthorizationStatusDenied:
+        case EKAuthorizationStatusRestricted:
+        {
+            [self rejectCalendarPermission];
         }
-    }
-
-    @ReactMethod
-    public void presentEventEditingDialog(ReadableMap config, Promise eventPromise) {
-        promise = eventPromise;
-        boolean shouldUseEditIntent = config.hasKey("useEditIntent") && config.getBoolean("useEditIntent");
-
-        // ACTION_EDIT does not work even though it should according to
-        // https://developer.android.com/guide/topics/providers/calendar-provider.html#intent-edit
-        // or https://stuff.mit.edu/afs/sipb/project/android/docs/guide/topics/providers/calendar-provider.html#intent-edit
-        // bug tracker: https://issuetracker.google.com/u/1/issues/36957942?pli=1
-        Intent intent = new Intent(shouldUseEditIntent ? Intent.ACTION_EDIT : Intent.ACTION_VIEW);
-
-        this.presentEventEditingActivity(config, intent);
-    }
-
-    @ReactMethod
-    public void presentEventViewingDialog(ReadableMap config, Promise eventPromise) {
-        promise = eventPromise;
-
-        Intent intent = new Intent(Intent.ACTION_VIEW);
-        this.presentEventEditingActivity(config, intent);
-    }
-
-    private void presentEventEditingActivity(ReadableMap config, Intent intent) {
-        String eventIdString = config.getString("eventId");
-        if (!doesEventExist(getReactApplicationContext().getContentResolver(), eventIdString)) {
-            rejectPromise("event with id " + eventIdString + " not found");
-            return;
-        }
-        shownOrEditedEventId = Long.valueOf(eventIdString);
-        Uri eventUri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, shownOrEditedEventId);
-
-        setPriorEventId(getCurrentActivity());
-
-        intent.setData(eventUri);
-
-        try {
-            getReactApplicationContext().startActivityForResult(intent, SHOW_EVENT_REQUEST_CODE, Bundle.EMPTY);
-        } catch (Exception e) {
-            rejectPromise(e);
-        }
-    }
-
-    private void setPriorEventId(Activity activity) {
-        if (activity != null) {
-            activity.getLoaderManager().initLoader(PRIOR_RESULT_ID, null, this);
-        }
-    }
-
-    @Override
-    public void onActivityResult(Activity activity, final int requestCode, final int resultCode, final Intent intent) {
-        if ((requestCode != ADD_EVENT_REQUEST_CODE && requestCode != SHOW_EVENT_REQUEST_CODE) || promise == null) {
-            return;
-        }
-        setPostEventId(activity);
-    }
-
-    private void setPostEventId(Activity activity) {
-        if (activity != null) {
-            activity.getLoaderManager().initLoader(POST_RESULT_ID, null, this);
-        }
-    }
-
-    // TODO get rid of the loaders?
-    @Override
-    public Loader onCreateLoader(int id, Bundle args) {
-        return new CursorLoader(getReactApplicationContext(),
-                CalendarContract.Events.CONTENT_URI,
-                new String[]{"MAX(_id) as max_id"}, null, null, "_id");
-    }
-
-    @Override
-    public void onLoadFinished(Loader loader, Object data) {
-        Cursor cursor = (Cursor) data;
-        if (cursor.isClosed()) {
-            Log.d(ADD_EVENT_MODULE_NAME, "cursor was closed; loader probably wasn't destroyed previously (destroyLoader() failed)");
-            rejectPromise("cursor was closed");
-            return;
-        }
-        Long lastEventId = extractLastEventId(cursor);
-
-        if (loader.getId() == PRIOR_RESULT_ID) {
-            eventPriorId = lastEventId;
-        } else if (loader.getId() == POST_RESULT_ID) {
-            returnResultBackToJS(lastEventId);
-        }
-
-        destroyLoader(loader);
-    }
-
-    private void returnResultBackToJS(@Nullable Long eventPostId) {
-        if (promise == null) {
-            Log.e(ADD_EVENT_MODULE_NAME, "promise is null");
-            return;
-        }
-
-        if (eventPriorId == null || eventPostId == null) {
-            promise.reject(ADD_EVENT_MODULE_NAME, "event prior and/or post id were null, extractLastEventId probably encountered a problem");
-        } else {
-            determineActionAndResolve(eventPriorId, eventPostId);
-        }
-        resetMembers();
-    }
-
-    private void determineActionAndResolve(long priorId, long postId) {
-        ContentResolver cr = getReactApplicationContext().getContentResolver();
-
-        boolean wasNewEventCreated = postId > priorId;
-        boolean doesPostEventExist = doesEventExist(cr, postId);
-
-        WritableMap result = Arguments.createMap();
-        String eventId = String.valueOf(postId);
-        if (doesPostEventExist && wasNewEventCreated) {
-            // react native bridge doesn't support passing longs
-            // plus we pass a map of Strings to be consistent with ios
-            result.putString("eventIdentifier", eventId);
-            result.putString("calendarItemIdentifier", eventId);
-            result.putString("action", SAVED);
-        } else if (!isEventBeingEdited() || doesEventExist(cr, shownOrEditedEventId)) {
-            // NOTE you'll get here even when you edit and save an existing event
-            result.putString("action", CANCELED);
-        } else {
-            result.putString("action", DELETED);
-        }
-        promise.resolve(result);
-    }
-
-    private void rejectPromise(Exception e) {
-        rejectPromise(e.getMessage());
-    }
-
-    private void rejectPromise(String e) {
-        if (promise == null) {
-            Log.e(ADD_EVENT_MODULE_NAME, "promise is null");
-            return;
-        }
-        promise.reject(ADD_EVENT_MODULE_NAME, e);
-        resetMembers();
-    }
-
-    private void destroyLoader(Loader loader) {
-        // if loader isn't destroyed, onLoadFinished() gets called multiple times for some reason
-        Activity activity = getCurrentActivity();
-        if (activity != null) {
-            activity.getLoaderManager().destroyLoader(loader.getId());
-        } else {
-            Log.d(ADD_EVENT_MODULE_NAME, "activity was null when attempting to destroy the loader");
-        }
-    }
-
-    @Override
-    public void onLoaderReset(Loader loader) {
-    }
-
-    @Override
-    public void onNewIntent(Intent intent) {
+            break;
+        default:
+            [self rejectCalendarPermission];
+            break;
     }
 }
+
+- (void)markCalendarAccessAsGranted
+{
+    self.defaultCalendar = [self getEventStoreInstance].defaultCalendarForNewEvents;
+    self.calendarAccessGranted = YES;
+    [self resolvePromise: @(YES)];
+}
+
+- (void)rejectCalendarPermission
+{
+    [self resolvePromise: @(NO)];
+}
+
+- (void)requestCalendarAccess
+{
+    AddCalendarEvent * __weak weakSelf = self;
+    [[self getEventStoreInstance] requestAccessToEntityType:EKEntityTypeEvent completion:^(BOOL granted, NSError *error)
+     {
+         dispatch_async(dispatch_get_main_queue(), ^{
+             if (granted) {
+                 [weakSelf markCalendarAccessAsGranted];
+             } else {
+                 [weakSelf rejectCalendarPermission];
+             }
+         });
+     }];
+}
+
+#pragma mark -
+#pragma mark Dialog methods
+
+RCT_EXPORT_METHOD(presentEventCreatingDialog:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+{
+    self.eventOptions = options;
+    self.resolver = resolve;
+    self.rejecter = reject;
+    
+    AddCalendarEvent * __weak weakSelf = self;
+    
+    void (^showEventCreatingController)(EKEvent *) = ^(EKEvent * event){
+        EKEventEditViewController *controller = [[EKEventEditViewController alloc] init];
+        controller.event = event;
+        controller.eventStore = [weakSelf getEventStoreInstance];
+        controller.editViewDelegate = weakSelf;
+        [weakSelf assignNavbarColorsTo:controller.navigationBar];
+        [weakSelf presentViewController:controller];
+    };
+    
+    [self runIfAccessGranted:showEventCreatingController withEvent:[self createNewEventInstance]];
+}
+
+- (void)runIfAccessGranted: (void (^)(EKEvent *))codeBlock withEvent: (EKEvent *) event
+{
+    if (self.calendarAccessGranted && event) {
+        codeBlock(event);
+    } else if (self.calendarAccessGranted && !event) {
+        NSString *evtId = self.eventOptions[_eventId];
+        [self rejectPromise:@"eventNotFound" withMessage:[NSString stringWithFormat:@"event with id %@ not found", evtId] withError:nil];
+    } else {
+        [self rejectPromise:@"accessNotGranted" withMessage:@"accessNotGranted" withError:nil];
+    }
+}
+
+RCT_EXPORT_METHOD(presentEventViewingDialog:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+{
+    self.eventOptions = options;
+    self.resolver = resolve;
+    self.rejecter = reject;
+    
+    AddCalendarEvent * __weak weakSelf = self;
+
+    void (^showEventViewingController)(EKEvent *) = ^(EKEvent * event){
+        EKEventViewController *controller = [[EKEventViewController alloc] init];
+        controller.event = event;
+        controller.delegate = weakSelf;
+        if (options[@"allowsEditing"]) {
+            controller.allowsEditing = [RCTConvert BOOL:options[@"allowsEditing"]];
+        }
+        if (options[@"allowsCalendarPreview"]) {
+            controller.allowsCalendarPreview = [RCTConvert BOOL:options[@"allowsCalendarPreview"]];
+        }
+        
+        UINavigationController *navBar = [[UINavigationController alloc] initWithRootViewController:controller];
+        [weakSelf assignNavbarColorsTo:navBar.navigationBar];
+        [weakSelf presentViewController:navBar];
+    };
+    
+    [self runIfAccessGranted:showEventViewingController withEvent:[self getEditedEventInstance]];
+}
+
+-(void)assignNavbarColorsTo: (UINavigationBar *) navigationBar
+{
+    NSDictionary * navbarOptions = _eventOptions[@"navigationBarIOS"];
+
+    if (navbarOptions) {
+        if (navbarOptions[@"tintColor"]) {
+            navigationBar.tintColor = [RCTConvert UIColor:navbarOptions[@"tintColor"]];
+        }
+        if (navbarOptions[@"backgroundColor"]) {
+            navigationBar.backgroundColor = [RCTConvert UIColor:navbarOptions[@"backgroundColor"]];
+        }
+        if (navbarOptions[@"translucent"]) {
+            navigationBar.translucent = [RCTConvert BOOL:navbarOptions[@"translucent"]];
+        }
+        if (navbarOptions[@"barTintColor"]) {
+            navigationBar.barTintColor = [RCTConvert UIColor:navbarOptions[@"barTintColor"]];
+        }
+        if(navbarOptions[@"titleColor"]) {
+            UIColor* titleColor = [RCTConvert UIColor:navbarOptions[@"titleColor"]];
+            navigationBar.titleTextAttributes = @{NSForegroundColorAttributeName: titleColor};
+        }
+    }
+}
+
+RCT_EXPORT_METHOD(presentEventEditingDialog:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject)
+{
+    self.eventOptions = options;
+    self.resolver = resolve;
+    self.rejecter = reject;
+    
+    AddCalendarEvent * __weak weakSelf = self;
+
+    void (^showEventEditingController)(EKEvent *) = ^(EKEvent * event){
+        EKEventEditViewController *controller = [[EKEventEditViewController alloc] init];
+        controller.event = event;
+        controller.eventStore = [weakSelf getEventStoreInstance];
+        controller.editViewDelegate = weakSelf;
+        [weakSelf assignNavbarColorsTo:controller.navigationBar];
+        [weakSelf presentViewController:controller];
+    };
+    
+    [self runIfAccessGranted:showEventEditingController withEvent:[self getEditedEventInstance]];
+}
+
+- (void)presentViewController: (UIViewController *) controller {
+    self.viewController = RCTPresentedViewController();
+    [self.viewController presentViewController:controller animated:YES completion:nil];
+}
+
+- (nullable EKEvent *)getEditedEventInstance {
+    EKEvent *maybeEvent = [[self getEventStoreInstance] eventWithIdentifier: _eventOptions[_eventId]];
+    if (!maybeEvent) {
+        maybeEvent = [[self getEventStoreInstance] calendarItemWithIdentifier: _eventOptions[_eventId]];
+    }
+    return maybeEvent;
+}
+
+- (EKEvent *)createNewEventInstance {
+    EKEvent *event = [EKEvent eventWithEventStore: [self getEventStoreInstance]];
+    NSDictionary *options = _eventOptions;
+
+    event.title = [RCTConvert NSString:options[_title]];
+    event.location = options[_location] ? [RCTConvert NSString:options[_location]] : nil;
+    
+    if (options[_startDate]) {
+        event.startDate = [RCTConvert NSDate:options[_startDate]];
+    }
+    if (options[_endDate]) {
+        event.endDate = [RCTConvert NSDate:options[_endDate]];
+    }
+    if (options[_url]) {
+        event.URL = [RCTConvert NSURL:options[_url]];
+    }
+    if (options[_notes]) {
+        event.notes = [RCTConvert NSString:options[_notes]];
+    }
+    if (options[_allDay]) {
+        event.allDay = [RCTConvert BOOL:options[_allDay]];
+    }
+    if (options[_alert]) {
+        NSDate *originalDate =  [RCTConvert NSDate:options[_startDate]];
+
+        if ([[RCTConvert NSString:options[_alert]] caseInsensitiveCompare:@"0"] == NSOrderedSame) 
+        { 
+            EKAlarm * alarm = [EKAlarm alarmWithAbsoluteDate:originalDate];
+            event.alarms = @[alarm];
+        }
+        if ([[RCTConvert NSString:options[_alert]] caseInsensitiveCompare:@"1"] == NSOrderedSame) 
+        { 
+            NSDate *alertReminder = [originalDate dateByAddingTimeInterval:-60*5]; 
+            EKAlarm * alarm = [EKAlarm alarmWithAbsoluteDate:alertReminder];
+            event.alarms = @[alarm];
+        }
+        if ([[RCTConvert NSString:options[_alert]] caseInsensitiveCompare:@"2"] == NSOrderedSame) 
+        {
+            NSDate *alertReminder = [originalDate dateByAddingTimeInterval:-60*30]; 
+            EKAlarm * alarm = [EKAlarm alarmWithAbsoluteDate:alertReminder];
+            event.alarms = @[alarm];
+        }
+        if ([[RCTConvert NSString:options[_alert]] caseInsensitiveCompare:@"3"] == NSOrderedSame) 
+        { 
+            NSDate *alertReminder = [originalDate dateByAddingTimeInterval:-60*60]; 
+            EKAlarm * alarm = [EKAlarm alarmWithAbsoluteDate:alertReminder];
+            event.alarms = @[alarm];
+        }
+    }
+    return event;
+}
+
+- (void)rejectPromise: (NSString *) code withMessage: (NSString *) message withError: (NSError *) error {
+    if (self.rejecter) {
+        self.rejecter(code, message, error);
+        [self resetPromises];
+    }
+}
+
+- (void)resetPromises {
+    self.resolver = nil;
+    self.rejecter = nil;
+}
+
+#pragma mark -
+#pragma mark EKEventEditViewDelegate
+
+- (void)eventEditViewController:(EKEventEditViewController *)controller
+          didCompleteWithAction:(EKEventEditViewAction)action
+{
+    AddCalendarEvent * __weak weakSelf = self;
+    [self.viewController dismissViewControllerAnimated:YES completion:^
+     {
+         dispatch_async(dispatch_get_main_queue(), ^{
+             if (action == EKEventEditViewActionCanceled) {
+                 [weakSelf resolveWithAction:CANCELED];
+             } else if (action == EKEventEditViewActionSaved) {
+                 EKEvent *evt = controller.event;
+                 NSDictionary *params = @{
+                                          @"eventIdentifier":evt.eventIdentifier,
+                                          @"calendarItemIdentifier":evt.calendarItemIdentifier,
+                                          };
+                 [weakSelf resolveWithAction:SAVED andParams:params];
+             } else if (action == EKEventEditViewActionDeleted) {
+                 [weakSelf resolveWithAction:DELETED];
+             }
+         });
+     }];
+}
+
+
+#pragma mark -
+#pragma mark EKEventViewDelegate
+
+- (void)eventViewController:(EKEventViewController *)controller
+      didCompleteWithAction:(EKEventViewAction)action
+{
+    AddCalendarEvent * __weak weakSelf = self;
+    [self.viewController dismissViewControllerAnimated:YES completion:^
+     {
+         dispatch_async(dispatch_get_main_queue(), ^{
+             if (action == EKEventViewActionDeleted) {
+                 [weakSelf resolveWithAction:DELETED];
+             } else if (action == EKEventViewActionDone) {
+                 [weakSelf resolveWithAction:DONE];
+             } else if (action == EKEventViewActionResponded) {
+                 [weakSelf resolveWithAction:RESPONDED];
+             }
+         });
+     }];
+}
+
+- (void)resolveWithAction: (NSString *)action {
+    [self resolvePromise: @{
+                             @"action": action
+                             }];
+}
+
+- (void)resolveWithAction: (NSString *)action andParams: (NSDictionary *) params {
+    NSMutableDictionary *extendedArgs = [params mutableCopy];
+    [extendedArgs setObject:action forKey:@"action"];
+    [self resolvePromise: extendedArgs];
+}
+
+- (void)resolvePromise: (id) result {
+    if (self.resolver) {
+        self.resolver(result);
+        [self resetPromises];
+    }
+}
+
+@end
